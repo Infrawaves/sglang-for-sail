@@ -14,7 +14,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
-from sglang.srt.utils.common import ceil_align, parse_connector_type
+from sglang.srt.utils.common import ceil_align, ceil_div, parse_connector_type
 
 logger = logging.getLogger(__name__)
 
@@ -170,9 +170,7 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
         token_partition_size = cfg.attn_cp_size
         token_partition_name = "attn_cp_size"
         token_alignment = token_partition_size if kimi else 1
-        local_chunked_prefill_size = (
-            prefill_tokens + token_partition_size - 1
-        ) // token_partition_size
+        local_chunked_prefill_size = ceil_div(prefill_tokens, token_partition_size)
     elif attn_dp_enabled_of(cfg):
         token_partition_size = cfg.attn_dp_size
         token_partition_name = "attn_dp_size"
@@ -181,8 +179,19 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
             1,
         )
         local_chunked_prefill_size = cfg.chunked_prefill_size // token_partition_size
+    elif (
+        kimi
+        and cfg.attn_cp_size == 1
+        and cfg.tp_size > 1
+        and not cfg.disable_attn_tp_gather
+    ):
+        # Kimi's MegaMoE FFN consumes one attention-TP shard of the padded rows.
+        # Without TP padding, an indivisible batch can reach each rank whole.
+        token_partition_size = cfg.tp_size
+        token_partition_name = "attn_tp_size (SP-MoE rows)"
+        token_alignment = 1
+        local_chunked_prefill_size = ceil_div(prefill_tokens, token_partition_size)
     else:
-        # Pure TP and PP with static chunking are handled here.
         token_partition_size = 1
         token_partition_name = "none"
         # global_num_tokens will ceil_align to attn_tp_size so the validation needs to do alignment as well
