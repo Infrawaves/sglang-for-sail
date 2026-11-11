@@ -197,7 +197,13 @@ def handle_context_parallelism(server_args: Any):
 
 def handle_shared_experts_tp(server_args: Any):
     cfg = resolving_view(server_args)
+    tp_sp = envs.SGLANG_K3_TP_SP.get()
     size = cfg.shared_experts_tp_size
+    if size is None and tp_sp:
+        size = cfg.tp_size
+        declare_resolution(
+            server_args, "_handle_shared_experts_tp", shared_experts_tp_size=size
+        )
     if size is None:
         return
 
@@ -222,6 +228,10 @@ def handle_shared_experts_tp(server_args: Any):
         "KimiK31ForConditionalGeneration",
     ):
         raise ValueError("--shared-experts-tp-size is only supported for Kimi-K3.")
+    if tp_sp:
+        if size not in (1, cfg.tp_size):
+            raise ValueError("K3 TP-SP supports shared expert TP size 1 or full TP.")
+        return
     if cfg.moe_a2a_backend not in (
         "deepep",
         "megamoe",

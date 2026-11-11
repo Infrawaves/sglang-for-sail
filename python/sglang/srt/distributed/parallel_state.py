@@ -92,6 +92,10 @@ _AITER_CAPTURE_COPY_IN = os.environ.get("SGLANG_AITER_CAPTURE_COPY_IN", "0") == 
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
+# Reserved tensor-dict key containing names of destination-local tensor shards.
+# These tensors bypass both send-side slicing and receive-side all-gather.
+PP_SHARDED_KEYS = "__pp_sharded_keys__"
+
 # use int value instead of ReduceOp.SUM to support torch compile
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 
@@ -1801,6 +1805,9 @@ class GroupCoordinator:
         async_send: bool = False,
     ) -> Optional[List[P2PWork]]:
         """Send the input tensor dictionary.
+
+        ``tensor_dict[PP_SHARDED_KEYS]`` may list tensors to transfer as-is,
+        bypassing the ``all_gather_group`` optimization on both ends.
         NOTE: `dst` is the local rank of the source rank.
         """
         # Bypass the function if we are using only 1 GPU.
@@ -1822,7 +1829,7 @@ class GroupCoordinator:
         assert isinstance(tensor_dict, dict), (
             f"Expecting a dictionary, got {type(tensor_dict)}"
         )
-        metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
+        metadata_list, _ = _split_tensor_dict(tensor_dict)
         # Note: While switching to Device-to-Device (D2D) would introduce an extra
         # Device-to-Host (D2H) memory copy overhead for serialization, our benchmarks
         # show better overall transmission performance with D2D due to:
@@ -1833,13 +1840,18 @@ class GroupCoordinator:
         send_func = torch.distributed.isend if async_send else torch.distributed.send
         p2p_works = self.send_object(metadata_list, dst=dst, async_send=async_send)
 
-        for tensor in tensor_list:
-            if tensor.numel() == 0:
+        sharded_keys = tensor_dict.get(PP_SHARDED_KEYS, ())
+        for key, tensor in tensor_dict.items():
+            if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
                 # Skip sending empty tensors.
                 continue
 
             # send-allgather: send only a slice, then do allgather.
-            if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
+            if (
+                key not in sharded_keys
+                and all_gather_group is not None
+                and tensor.numel() % all_gather_size == 0
+            ):
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
             comm_group = metadata_group if tensor.is_cpu else group
@@ -1854,6 +1866,8 @@ class GroupCoordinator:
         all_gather_group: Optional["GroupCoordinator"] = None,
     ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
         """Recv the input tensor dictionary.
+
+        Honors ``PP_SHARDED_KEYS`` metadata from :meth:`send_tensor_dict`.
         NOTE: `src` is the local rank of the source rank.
         """
         # Bypass the function if we are using only 1 GPU.
@@ -1873,6 +1887,7 @@ class GroupCoordinator:
         assert src < self.world_size, f"Invalid src rank ({src})"
 
         recv_metadata_list = self.recv_object(src=src)
+        sharded_keys = dict(recv_metadata_list).get(PP_SHARDED_KEYS, ())
         tensor_dict: Dict[str, Any] = {}
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
@@ -1884,7 +1899,8 @@ class GroupCoordinator:
 
                 # send-allgather: send only a slice, then do allgather.
                 use_all_gather = (
-                    all_gather_group is not None
+                    key not in sharded_keys
+                    and all_gather_group is not None
                     and tensor.numel() % all_gather_size == 0
                 )
 
@@ -1922,6 +1938,8 @@ class GroupCoordinator:
         atomically, avoiding deadlock on backends (e.g. NPU/HCCL) where
         ``isend`` may block until a matching ``recv`` is posted.
 
+        Honors ``PP_SHARDED_KEYS`` metadata from :meth:`send_tensor_dict`.
+
         NOTE: ``send_dst`` / ``recv_src`` are local ranks within this group.
         """
         if not torch.distributed.is_initialized() or self.world_size == 1:
@@ -1939,7 +1957,7 @@ class GroupCoordinator:
         metadata_group = self.cpu_group
 
         # ---- 1. Exchange metadata via batch_isend_irecv on CPU group ----
-        send_metadata_list, send_tensor_list = _split_tensor_dict(send_tensor_dict)
+        send_metadata_list, _ = _split_tensor_dict(send_tensor_dict)
 
         send_meta_bytes = pickle.dumps(send_metadata_list)
         send_meta_size = torch.tensor([len(send_meta_bytes)], dtype=torch.long)
@@ -1987,6 +2005,7 @@ class GroupCoordinator:
             req.wait()
 
         recv_metadata_list = pickle.loads(recv_meta_data.numpy())
+        recv_sharded_keys = dict(recv_metadata_list).get(PP_SHARDED_KEYS, ())
 
         # ---- 2. Prepare recv buffers and collect all tensor ops ----
         recv_tensor_dict: Dict[str, Any] = {}
@@ -2003,7 +2022,8 @@ class GroupCoordinator:
                     continue
 
                 use_all_gather = (
-                    recv_all_gather_group is not None
+                    key not in recv_sharded_keys
+                    and recv_all_gather_group is not None
                     and tensor.numel() % recv_all_gather_group.world_size == 0
                 )
                 orig_shape = None
@@ -2027,12 +2047,14 @@ class GroupCoordinator:
                 recv_tensor_dict[key] = value
 
         # Add send ops
-        for tensor in send_tensor_list:
-            if tensor.numel() == 0:
+        send_sharded_keys = send_tensor_dict.get(PP_SHARDED_KEYS, ())
+        for key, tensor in send_tensor_dict.items():
+            if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
                 continue
             send_t = tensor
             if (
-                send_all_gather_group is not None
+                key not in send_sharded_keys
+                and send_all_gather_group is not None
                 and send_t.numel() % send_all_gather_group.world_size == 0
             ):
                 send_t = send_t.reshape(send_all_gather_group.world_size, -1)[
@@ -2681,6 +2703,7 @@ def initialize_model_parallel(
     moe_data_model_parallel_size = parallel.moe_dp_size
     decode_context_parallel_size = parallel.attn_dcp_size
     shared_experts_tensor_parallel_size = parallel.shared_experts_tp_size
+    tp_sp = envs.SGLANG_K3_TP_SP.get()
 
     # Joiners construct their local TP/PP layout in global rank space.
     world_size: int = (
@@ -2890,9 +2913,11 @@ def initialize_model_parallel(
         shared_experts_tensor_parallel_size is not None
         and shared_experts_tensor_parallel_size > 1
     ):
-        if shared_experts_tensor_parallel_size == attn_tp_size:
+        if shared_experts_tensor_parallel_size == attn_tp_size and not tp_sp:
             _SHARED_EXPERTS_TP = _ATTN_TP
         else:
+            # TP-SP needs its own communicator even for full shared TP:
+            # shared AG/RS run on alt while routed AG/RS run on main.
             # Attention TP groups are contiguous, and the requested width
             # divides each one. These groups also stay inside their PP stage.
             shared_size = shared_experts_tensor_parallel_size

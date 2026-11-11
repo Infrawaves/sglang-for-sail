@@ -2040,6 +2040,8 @@ class Envs:
     # kernels/ops/attention/dcp_push_combine.py.
     SGLANG_DCP_PUSH_COMBINE = EnvBool(True)
     SGLANG_DCP_PUSH_COMBINE_MAX_ROWS = EnvInt(1024)
+    # Eager-prefill sequence parallelism for Kimi-K3/K3.1 tensor-parallel MoE.
+    SGLANG_K3_TP_SP = EnvBool(False)
     # Keep K3's post-MoE residual stream token-sharded between consecutive
     # SP-MoE layers. The next attention-residual aggregation and snapshot
     # bank write run on the local shard, then only the normalized attention

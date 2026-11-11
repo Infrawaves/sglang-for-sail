@@ -10,6 +10,17 @@ from sglang.kernels.spec import CapabilityRequirement, KernelBackend, KernelSpec
 
 __all__ = []
 
+for _fn in ("pack_moe_inputs", "unpack_moe_inputs"):
+    register_kernel(
+        KernelSpec(
+            op=f"communication.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.communication.k3_moe_pack:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.CUDA}),
+        )
+    )
+del _fn
+
 register_kernel(
     KernelSpec(
         op="communication.moe_finalize_shared_gate_all_reduce",

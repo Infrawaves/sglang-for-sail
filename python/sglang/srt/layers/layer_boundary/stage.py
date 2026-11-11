@@ -25,7 +25,6 @@ from sglang.srt.layers.layer_boundary.adapters.lora import (
     publish_ffn_lora_rows,
 )
 from sglang.srt.layers.layer_boundary.contracts import (
-    BatchVariant,
     EntryPath,
     StageKind,
     StagePath,
@@ -135,7 +134,9 @@ class StageBoundary:
     def input_on_attn_tp_slices(self):
         return self.plan.input_on_attn_tp_slices
 
-    def prepare(self, hidden_states, forward_batch, *, cache=None, **call):
+    def prepare(
+        self, hidden_states, forward_batch, *, cache=None, variant=None, **call
+    ):
         """Finish the previous contribution and produce this stage's compute input.
 
         Args:
@@ -143,6 +144,8 @@ class StageBoundary:
                 forward's residual stream. Do not unwrap or modify a partial sum.
             forward_batch: Batch owning the stream and selecting the prepared path.
             cache: FFN-only NPU weight cache prefetched on the FFN input path.
+            variant: Explicit path selected by a caller that owns row transport.
+                None selects the ordinary batch-dependent path.
             **call: Attention-only read/adapter options: quant_format,
                 post_residual_addition, capture_gathered and capture. FFN
                 stages do not accept these options. capture is a callback on
@@ -158,6 +161,8 @@ class StageBoundary:
         """
         if cache is not None:
             call["cache"] = cache
+        if variant is not None:
+            call["steps"] = self.plan.paths[variant]
         prepare = (
             self._prepare_attention
             if self.kind is StageKind.ATTENTION
@@ -168,17 +173,30 @@ class StageBoundary:
         )
         return hidden_states
 
-    def finish(self, hidden_states, forward_batch):
+    def finish(self, hidden_states, forward_batch, *, variant=None):
         """Hand this stage's output to the following stage: an attention's
         actual contribution, or an FFN's or a mixer's output with its sum
         completed or carried on. An FFN whose boundary has fusions (which may
-        take a MoE finalize handoff) finishes through exit() instead."""
+        take a MoE finalize handoff) finishes through exit() instead.
+        An explicit variant completes through that path without exit deferral."""
         if self.kind is StageKind.ATTENTION and self.plan.finishes_directly:
-            produced = self.plan.path_for(forward_batch).output
+            steps = (
+                self.plan.path_for(forward_batch)
+                if variant is None
+                else self.plan.paths[variant]
+            )
+            produced = steps.output
             return stream_of(forward_batch).record(
                 hidden_states,
                 produced.update,
                 declared_sum=produced.group if produced.always_partial else None,
+            )
+        if variant is not None:
+            return self.plan.output.complete_now(
+                hidden_states,
+                stream_of(forward_batch),
+                forward_batch,
+                steps=self.plan.paths[variant],
             )
         if self.kind is StageKind.FFN and self.plan.fusions is not None:
             raise RuntimeError(
@@ -320,8 +338,9 @@ class StageBoundary:
         forward_batch.residual_stream = stream
         return hidden_states
 
-    def _prepare_input(self, hidden_states, stream, forward_batch, **call):
-        hidden_states, steps = self._select(hidden_states, forward_batch)
+    def _prepare_input(self, hidden_states, stream, forward_batch, steps=None, **call):
+        if steps is None:
+            hidden_states, steps = self._select(hidden_states, forward_batch)
         return self._prepare(hidden_states, stream, forward_batch, steps, **call)
 
     def _select(self, hidden_states, forward_batch):
@@ -331,10 +350,7 @@ class StageBoundary:
         plan = self.plan
         if self.kind is StageKind.ATTENTION:
             publish_attn_lora_rows(plan._publish_lora_layout)
-            if (
-                plan.paths.get(BatchVariant.SEQUENCE_PARALLEL) is not None
-                and plan.enters_stack
-            ):
+            if layernorm_sp.layernorm_sp_enabled() and plan.enters_stack:
                 get_forward().set(
                     "sp_active", layernorm_sp.runs_sp(forward_batch.forward_mode)
                 )
@@ -354,6 +370,7 @@ class StageBoundary:
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_format: str = "",
         capture: Optional[Callable] = None,
+        steps: Optional[StagePath] = None,
     ):
         # Aux consumers need a materialized output before the input norm.
         # Complete communication here, preserving the existing add+norm kernel
@@ -372,7 +389,8 @@ class StageBoundary:
                     capture(value)
                 else:
                     capture(value + previous, owned=True)
-        hidden_states, steps = self._select(hidden_states, forward_batch)
+        if steps is None:
+            hidden_states, steps = self._select(hidden_states, forward_batch)
         hidden_states, stream = self._prepare(
             hidden_states,
             stream,

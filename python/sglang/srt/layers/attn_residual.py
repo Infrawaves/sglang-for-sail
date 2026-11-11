@@ -780,6 +780,11 @@ class AttnResidual:
                 "them would aggregate stale snapshots"
             )
         nvb = self.num_valid_blocks
+        if hidden_states.shape[0] == 0:
+            prefix = hidden_states if prefix_sum is None else prefix_sum + hidden_states
+            if write:
+                self.write(prefix, rows)
+            return hidden_states, prefix
         # Layer 0 attention side: nothing banked yet
         if nvb == 0:
             assert prefix_sum is None

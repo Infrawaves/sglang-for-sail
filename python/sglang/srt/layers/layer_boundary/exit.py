@@ -199,10 +199,12 @@ class ExitPolicy:
         forward_batch: ForwardBatch,
         *,
         already_reduced: bool = False,
+        steps=None,
     ):
         """Complete the output of the operation-scheduled producer path, which
         never defers: the sum it owes, then its move and write-back."""
-        steps = self.plan.path_for(forward_batch)
+        if steps is None:
+            steps = self.plan.path_for(forward_batch)
         if already_reduced and steps.output_move_completes_sum:
             raise ValueError("already-reduced output cannot use a reduce-scatter move")
         hidden_states, residual = self._complete_now(

@@ -245,9 +245,13 @@ class Parallel(msgspec.Struct):
     ] = False
     shared_experts_tp_size: A[
         Optional[int],
-        "Shared-expert TP size for Kimi-K3 with an expert-parallel all-to-all "
-        "backend. Must divide attention TP size. Overrides "
-        "--enable-shared-experts-attn-tp when set; 1 replicates the weights.",
+        Arg(
+            help="Shared-expert TP size for Kimi-K3. With an expert-parallel all-to-all "
+            "backend, must divide attention TP size; with TP-SP, must be 1 or full TP. Overrides "
+            "--enable-shared-experts-attn-tp when set; 1 replicates the weights. "
+            "Defaults to full TP with TP-SP.",
+            resolvable=True,
+        ),
     ] = None
     enable_dense_mlp_attn_tp: A[
         bool,
