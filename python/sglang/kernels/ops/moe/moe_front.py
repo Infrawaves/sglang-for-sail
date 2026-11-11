@@ -47,6 +47,7 @@ import torch
 
 from sglang.kernels.jit.utils import (
     cache_once,
+    get_jit_cuda_arch,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
@@ -208,6 +209,9 @@ def fused_front(
     device = hidden_states.device
     if config is None:
         config = get_config("epilogue", M, device, DEFAULT_EPILOGUE_CONFIG)
+        # cast_vec 8 needs 32B vector loads; route_radix.cuh only builds it on Blackwell.
+        if get_jit_cuda_arch().major < 10:
+            config["cast_vec"] = min(int(config["cast_vec"]), 4)
 
     # fp32 out keeps routing exact; the extra output traffic versus bf16 is
     # M x (896 + latent) x 2 bytes, negligible against the 64 MB weight read at

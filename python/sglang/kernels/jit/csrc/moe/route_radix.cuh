@@ -713,21 +713,28 @@ struct FusedFrontEpilogueKernel {
     params.routed_stride = static_cast<long long>(routed.stride(0));
 
     // Tunables come from the JSON config table; see kernels/ops/moe/moe_front.py.
-    // cast_vec * 4 bytes per thread must stay inside the 32B vector-load limit.
-    RuntimeCheck(cast_vec == 2 || cast_vec == 4 || cast_vec == 8, "fused_front_epilogue: cast_vec must be 2, 4 or 8");
+    // cast_vec * 4 bytes per thread must stay inside the arch vector-load limit:
+    // cast_vec 8 needs 32B loads (Blackwell); 16B archs (Hopper, AMD, PPU) stop at 4.
+    constexpr bool kSupportsCastVec8 = sizeof(fp32x2_t) * 4 <= ::sglang::device::kMaxVecBytes;
+    RuntimeCheck(
+        cast_vec == 2 || cast_vec == 4 || (kSupportsCastVec8 && cast_vec == 8),
+        "fused_front_epilogue: cast_vec must be 2, 4, or 8 (8 needs 32B vector loads), got ",
+        cast_vec);
     RuntimeCheck(latent % cast_vec == 0, "fused_front_epilogue: cast_vec must divide latent");
 
 #define SGL_FRONT_LAUNCH(BS, CV, CF) \
   LaunchKernel(M, BS, device.unwrap()).enable_pdl(kUsePDL)(fused_front_epilogue_kernel<kUsePDL, BS, CV, CF>, params)
-#define SGL_FRONT_DISPATCH_CV(BS, CF) \
-  do {                                \
-    if (cast_vec == 2) {              \
-      SGL_FRONT_LAUNCH(BS, 2, CF);    \
-    } else if (cast_vec == 4) {       \
-      SGL_FRONT_LAUNCH(BS, 4, CF);    \
-    } else {                          \
-      SGL_FRONT_LAUNCH(BS, 8, CF);    \
-    }                                 \
+#define SGL_FRONT_DISPATCH_CV(BS, CF)     \
+  do {                                    \
+    if (cast_vec == 2) {                  \
+      SGL_FRONT_LAUNCH(BS, 2, CF);        \
+    } else if (cast_vec == 4) {           \
+      SGL_FRONT_LAUNCH(BS, 4, CF);        \
+    } else {                              \
+      if constexpr (kSupportsCastVec8) {  \
+        SGL_FRONT_LAUNCH(BS, 8, CF);      \
+      }                                   \
+    }                                     \
   } while (0)
 #define SGL_FRONT_DISPATCH_BS(CF)     \
   do {                                \
