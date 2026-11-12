@@ -328,6 +328,8 @@ class StageDeclaration:
             function, without the declaring layer, so it may use only the
             communication state of the rank it runs on, not that layer's
             weights or buffers.
+        sequence_parallel: Bind a sequence-parallel path whose compute owns
+            input gathering and output reduction onto local token rows.
         previous: The stage whose output this stage consumes, as the stack
             records it: only the facts binding reads of it (see facts_of),
             on this rank or another.
@@ -352,6 +354,7 @@ class StageDeclaration:
     output_complete: bool = False
     output_on_cp_shards: bool = False
     attn_tp_gather: Optional[Callable] = None
+    sequence_parallel: bool = False
     # Only declarations participate in construction, never executable stages.
     previous: Optional[StageDeclaration] = None
     prepared_from: Optional[StageDeclaration] = None
@@ -452,6 +455,7 @@ def declare_attn(
     output_transform=None,
     tp_group=SumGroup.ATTN_TP,
     attn_tp_gather=None,
+    sequence_parallel=False,
 ):
     """Declare attention or a mixer; construct its executable boundary later.
 
@@ -468,6 +472,8 @@ def declare_attn(
         tp_group: Head partition; ATTN_TP by default, TP for full-TP consumers.
         attn_tp_gather: Implementation of the gather over attention TP into
             this stage, tried before the boundary's own (see StageDeclaration).
+        sequence_parallel: Also bind the shared SP layout for explicit
+            compute-owned gathers and reduce-scatters.
 
     Returns:
         A StageDeclaration with no norm, tensors or execution plan.
@@ -486,6 +492,7 @@ def declare_attn(
         gathers_attn_tp_input=gathers_attn_tp_input,
         tp_group=tp_group,
         attn_tp_gather=attn_tp_gather,
+        sequence_parallel=sequence_parallel,
     )
 
 
@@ -615,6 +622,10 @@ def _resolve_stage(stage, variant, arrival, following=None):
             output_complete=stage.output_complete,
             output_on_cp_shards=stage.output_on_cp_shards,
         )
+        if variant is BatchVariant.SEQUENCE_PARALLEL:
+            # SP compute returns complete local rows, including at PP/final
+            # boundaries; the model gathers only after its terminal read.
+            return _Flow(declaration, arrival, residual, returned)
         exit_rows = resolve_exit_rows(stage.exit_rows)
         if exit_rows is ExitRows.ATTENTION or (
             following is not None and following.read.reads_after_attn_tp_gather
@@ -637,12 +648,16 @@ def _resolve_stage(stage, variant, arrival, following=None):
     compute_rows = attention
     if stage.tp_group is SumGroup.TP:
         parallel = get_parallel()
-        if parallel.attn_dp_size != 1 or sp or scattered:
+        if (
+            parallel.attn_dp_size != 1
+            or scattered
+            or (sp and parallel.attn_tp_size != parallel.tp_size)
+        ):
             raise NotImplementedError(
                 "full-TP attention requires unscattered input without attention DP"
             )
         compute_rows = full
-        owes = parallel.tp_size > 1
+        owes = not sp and parallel.tp_size > 1
         # Canonicalize equal groups to the CP transport's reduction contract.
         # initialize_model_parallel aliases ATTN_CP to TP at this topology.
         group = (
@@ -766,6 +781,11 @@ def _connect_line(line, origins, *, before=None, after=None, arrivals=None):
     names the append at ``origins[i]`` that declared ``line[i]``, or the one
     next to the neighbouring rank's stage."""
     variants = tuple(_active_variants())
+    if (
+        any(stage.sequence_parallel for stage in line)
+        and BatchVariant.SEQUENCE_PARALLEL not in variants
+    ):
+        variants += (BatchVariant.SEQUENCE_PARALLEL,)
 
     def resolve(position, stage, arrivals, following=None):
         try:
