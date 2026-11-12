@@ -253,6 +253,7 @@ class ExecKernel(msgspec.Struct):
             choices=[
                 "flashmla_sparse",
                 "flashmla_sparse_q8",
+                "flashmla_sparse_quantized",
                 "flashmla_kv",
                 "flashmla_auto",
                 "flashinfer_sparse_mla",

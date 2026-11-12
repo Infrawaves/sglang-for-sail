@@ -32,7 +32,10 @@ from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import (
     dcp_gather_request_rows,
     dcp_global_topk,
 )
-from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
+from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
+    BaseIndexerMetadata,
+    DSAIndexerMetadata,
+)
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import DSANPUIndexerMixin
 from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     GRAPH_WEIGHTS_PROJ_LORA_ERROR,
@@ -40,6 +43,7 @@ from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     bcg_dsa_indexer_prefill_split,
     pcg_dsa_indexer_prefill_split,
 )
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
@@ -1212,9 +1216,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         weights: torch.Tensor,
         cu_seq_len_k_start: torch.Tensor,
         cu_seq_len_k_end: torch.Tensor,
+        *,
+        metadata: BaseIndexerMetadata,
         clean_logits: bool = True,
-        force_unfused_topk: bool = False,
     ):
+        # Both SGL ragged top-k kernels consume fp32 scores, including the fused path.
+        fp32_scores = getattr(metadata, "force_unfused_topk", False) or (
+            isinstance(metadata, DSAIndexerMetadata)
+            and metadata.topk_backend.is_sgl_kernel()
+            and metadata.topk_transform_method == TopkTransformMethod.RAGGED
+        )
         if self.use_fp4:
             # FP4 path: q = (q_packed_uint8, q_sf_int32), kv = (k_packed_uint8, k_sf_int32_byte).
             # DeepGEMM expects q/k packed values as int8 (kPackedFP4) and
@@ -1232,8 +1243,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 cu_seq_len_k_start,
                 cu_seq_len_k_end,
                 clean_logits=clean_logits,
-                # Unfused topk (fast_topk_v2) requires fp32; the fused bf16 kernel consumes bf16 directly.
-                logits_dtype=torch.float32 if force_unfused_topk else torch.bfloat16,
+                logits_dtype=torch.float32 if fp32_scores else torch.bfloat16,
             )
 
         assert isinstance(q, torch.Tensor)
@@ -1274,8 +1284,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 cu_seq_len_k_start,
                 cu_seq_len_k_end,
                 clean_logits=clean_logits,
-                # Unfused topk (fast_topk_v2) requires fp32; the fused bf16 kernel consumes bf16 directly.
-                logits_dtype=torch.float32 if force_unfused_topk else torch.bfloat16,
+                logits_dtype=torch.float32 if fp32_scores else torch.bfloat16,
             )
         raise NotImplementedError
 
@@ -2305,9 +2314,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                         ks,
                         ke,
                         clean_logits=False,
-                        force_unfused_topk=getattr(
-                            metadata, "force_unfused_topk", False
-                        ),
+                        metadata=metadata,
                     )
             assert logits.shape[0] == len(seq_lens_expanded)
             assert logits.shape[1] == k_offset
@@ -2388,9 +2395,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                         ks[start:end],
                         ke[start:end],
                         clean_logits=False,
-                        force_unfused_topk=getattr(
-                            metadata, "force_unfused_topk", False
-                        ),
+                        metadata=metadata,
                     )
 
             lengths_chunk = seq_lens_expanded[start:end]
@@ -2745,7 +2750,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     ks,
                     ke,
                     clean_logits=False,
-                    force_unfused_topk=getattr(metadata, "force_unfused_topk", False),
+                    metadata=metadata,
                 )
             topk_result = metadata.topk_transform(
                 logits,
@@ -2804,7 +2809,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     ks,
                     ke,
                     clean_logits=False,
-                    force_unfused_topk=getattr(metadata, "force_unfused_topk", False),
+                    metadata=metadata,
                 )
             actual_seq_q = torch.tensor([actual_seq_q], dtype=torch.int32).to(
                 device="cuda", non_blocking=True

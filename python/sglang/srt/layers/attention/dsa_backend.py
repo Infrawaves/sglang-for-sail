@@ -409,6 +409,7 @@ def _cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
 _DSA_IMPL_T: TypeAlias = Literal[
     "flashmla_sparse",
     "flashmla_sparse_q8",
+    "flashmla_sparse_quantized",
     "flashmla_kv",
     "flashinfer_sparse_mla",
     "triton_sparse_mla",
@@ -857,6 +858,17 @@ class DeepseekSparseAttnBackend(
             self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+
+        if self.dsa_prefill_impl == "flashmla_sparse_quantized" and not (
+            _is_sail
+            and self.kimi_k31
+            and self.device_capability == (8, 9)
+            and self.dsa_kv_cache_store_fp8
+        ):
+            raise ValueError(
+                "flashmla_sparse_quantized requires Kimi-K3.1 on ZW-M890P "
+                "with a packed FP8 KV cache."
+            )
 
         # Unsupported flashmla_sparse_q8 configs must fail at launch, not mid-forward.
         _validate_flashmla_sparse_q8_backend(
@@ -1545,10 +1557,16 @@ class DeepseekSparseAttnBackend(
             )
             forward_batch.using_mha_one_shot_fp8_dequant = mha_dequantize_needed
 
-            # page_table_1_flattened is only used when prefix sharing is enabled:
             has_prefix_sharing = any(forward_batch.extend_prefix_lens_cpu)
+            # Ragged offsets omit requests with no local queries. A fresh CP
+            # all-gather still contains them, so gather the selected cache rows.
+            gather_cp_subset = (
+                dsa_impl_for_batch == "flashmla_sparse_quantized"
+                and bs_idx_cpu is not None
+                and len(bs_idx_cpu) < batch_size
+            )
             if (
-                has_prefix_sharing
+                (has_prefix_sharing or gather_cp_subset)
                 and (
                     topk_transform_method == TopkTransformMethod.RAGGED
                     or mha_dequantize_needed
@@ -2543,17 +2561,15 @@ class DeepseekSparseAttnBackend(
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
-        # q8 is only wired on the RAGGED route; PAGED would run the bf16 kernel.
+        # Flat quantized prefill consumes ragged row IDs, not physical cache slots.
         if (
-            dsa_impl == "flashmla_sparse_q8"
+            dsa_impl in ("flashmla_sparse_q8", "flashmla_sparse_quantized")
             and topk_indices is not None
             and topk_transform_method != TopkTransformMethod.RAGGED
         ):
             raise NotImplementedError(
-                "--dsa-prefill-backend flashmla_sparse_q8 supports EXTEND prefill "
-                f"batches only; got forward_mode={forward_batch.forward_mode.name} "
-                "(SPLIT_PREFILL under --enable-pdmux, or DLLM_EXTEND under "
-                "--dllm-algorithm; --enable-mixed-chunk is rejected at launch)."
+                f"--dsa-prefill-backend {dsa_impl} supports EXTEND prefill "
+                f"batches only; got forward_mode={forward_batch.forward_mode.name}."
             )
 
         if self.use_fused_topk:
@@ -2563,10 +2579,14 @@ class DeepseekSparseAttnBackend(
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         else:
             if topk_transform_method == TopkTransformMethod.RAGGED:
-                if topk_indices is not None:
-                    topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
                 topk_indices_offset = metadata.topk_indices_offset
                 assert topk_indices_offset is not None
+                # Only live queries have request offsets. CP/DP padding rows
+                # carry -1 and are appended after the transform.
+                live_rows = topk_indices_offset.shape[0]
+                topk_indices = self._pad_topk_indices(
+                    topk_indices[:live_rows], live_rows
+                )
                 mask = topk_indices != -1
                 topk_indices_offset = (
                     topk_indices_offset.unsqueeze(1)
@@ -2576,6 +2596,7 @@ class DeepseekSparseAttnBackend(
                 topk_indices = torch.where(
                     mask, topk_indices + topk_indices_offset, topk_indices
                 )
+                topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
             elif topk_transform_method == TopkTransformMethod.PAGED:
                 assert metadata.dsa_extend_seq_lens_list is not None
                 page_table_1 = transform_index_page_table_prefill(
@@ -2643,6 +2664,12 @@ class DeepseekSparseAttnBackend(
                     if self.dsa_index_kpool <= 1
                     else None
                 ),
+            )
+        elif dsa_impl == "flashmla_sparse_quantized":
+            if q_all is None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_flashmla_sparse_quantized(
+                q_all, kv_cache, k, k_rope, topk_indices, layer
             )
         elif dsa_impl in (
             "flashmla_sparse",
@@ -3118,6 +3145,75 @@ class DeepseekSparseAttnBackend(
             num_splits=self.num_splits,
         )
         return o  # type: ignore
+
+    def _forward_flashmla_sparse_quantized(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        k: torch.Tensor,
+        k_rope: torch.Tensor,
+        topk_indices: torch.Tensor,
+        layer: RadixAttention,
+    ) -> torch.Tensor:
+        from flash_mla import flash_mla_sparse_quantized_fwd
+
+        metadata = self.forward_metadata
+        slots = metadata.page_table_1_flattened
+        if slots is None:
+            num_kv_tokens = k.shape[0]
+            kv = k.new_empty(
+                (num_kv_tokens, q_all.shape[-1]), dtype=torch.float8_e4m3fn
+            )
+            kv_cache = concat_cast_kv_fp8_pad(kv, k, k_rope, num_kv_tokens).unsqueeze(1)
+        else:
+            if self.attn_dcp_size > 1:
+                # dcp_gather_kv_cache already put these rows in request order.
+                slots = self.get_device_int32_arange(slots.numel())
+            kv_cache = gather_dequant_requant_fp8_paged(kv_cache, slots)
+
+        # FlashMLA sparse kernel requires num_heads to be a multiple of 64 (Hopper) or 128 (Blackwell)
+        # When using TP, num_heads might be smaller (e.g., 256//8=32)
+        num_tokens, num_heads, head_dim = q_all.shape
+
+        # Determine required padding based on GPU architecture (use cached value)
+        required_padding = 128 if self.device_sm_major >= 10 else 64
+        if _is_sail and self.kimi_k31:
+            required_padding = (
+                (num_heads + required_padding - 1) // required_padding
+            ) * required_padding
+
+        need_padding = num_heads % required_padding != 0
+
+        if need_padding:
+            assert required_padding % num_heads == 0 or (
+                _is_sail and self.kimi_k31 and num_heads < required_padding
+            ), (
+                f"num_heads {num_heads} cannot be padded to {required_padding}. "
+                f"TP size may be too large for this model."
+            )
+
+            # Pad q to required size
+            q_padded = q_all.new_zeros((num_tokens, required_padding, head_dim))
+            q_padded[:, :num_heads, :] = q_all
+            q_input = q_padded
+        else:
+            q_input = q_all
+
+        topk_length = metadata.dsa_cache_seqlens_int32
+        if topk_length.shape[0] != q_input.shape[0]:
+            topk_length = None  # The kernel masks -1 entries in padded query rows.
+        o, _, _ = flash_mla_sparse_quantized_fwd(
+            q=q_input,
+            kv=kv_cache,
+            indices=topk_indices.unsqueeze(1),
+            sm_scale=layer.scaling,
+            d_v=layer.v_head_dim,
+            topk_length=topk_length,
+            compute_aux=False,
+        )
+        if need_padding:
+            o = o[:, :num_heads, :]
+        return o
 
     def _forward_flashmla_sparse(
         self,
@@ -4654,7 +4750,12 @@ class DeepseekSparseAttnBackend(
             # triton_sparse_mla is listed for an fp8 pool: its dispatch also
             # dequantizes inside the RAGGED branch and its kernel is bf16-only.
             and self.dsa_prefill_impl
-            in ("flashmla_sparse", "flashmla_sparse_q8", "triton_sparse_mla")
+            in (
+                "flashmla_sparse",
+                "flashmla_sparse_q8",
+                "flashmla_sparse_quantized",
+                "triton_sparse_mla",
+            )
             and forward_mode == ForwardMode.EXTEND
         ):
             topk_transform_method = TopkTransformMethod.RAGGED

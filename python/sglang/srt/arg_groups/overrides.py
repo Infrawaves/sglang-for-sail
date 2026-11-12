@@ -766,6 +766,16 @@ def _kimi_k31_kv_cache_dtype(view: Any) -> dict:
 def _kimi_k31_dsa_backends(view: Any) -> dict:
     if view.enable_hisparse:
         raise ValueError("Kimi-K3.1 does not support --enable-hisparse yet.")
+    if view.dsa_prefill_backend == "flashmla_sparse_quantized" and is_sail():
+        if view.dsa_decode_backend is None:
+            return {"dsa_decode_backend": _KIMI_K31_DSA_BACKEND}
+        if view.dsa_decode_backend != _KIMI_K31_DSA_BACKEND:
+            raise ValueError(
+                "Kimi-K3.1 flashmla_sparse_quantized prefill requires "
+                "--dsa-decode-backend flashmla_kv."
+            )
+        return {}
+
     fields = ("dsa_prefill_backend", "dsa_decode_backend")
     for field in fields:
         value = getattr(view, field)
