@@ -41,6 +41,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPv2Dispatcher
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
 from sglang.srt.layers.moe.token_dispatcher.standard import (
+    Mxfp4RoutedInputPreQuant,
     StandardDispatcher,
 )
 from sglang.srt.layers.moe.topk import (
@@ -1642,7 +1643,14 @@ class FusedMoE(torch.nn.Module):
         topk_output: TopKOutput,
         pre_quant_input: Optional[Tuple] = None,
     ):
-        origin_hidden_states_dim = hidden_states.shape[-1]
+        origin_hidden_states_dim = (
+            pre_quant_input.hidden_size
+            if isinstance(pre_quant_input, Mxfp4RoutedInputPreQuant)
+            else hidden_states.shape[-1]
+        )
+        if isinstance(pre_quant_input, Mxfp4RoutedInputPreQuant):
+            assert isinstance(self.dispatcher, StandardDispatcher)
+            assert self.moe_ep_size == 1
         assert self.quant_method is not None
 
         if self._dwdp_bound:

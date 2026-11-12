@@ -59,13 +59,23 @@ except ImportError:
     nvfp4_block_scale_interleave_flashinfer = None
 
 
+class Mxfp4RoutedInputPreQuant(NamedTuple):
+    """Row-major PPU W4A4 input; the packed width is half the logical width."""
+
+    quant: torch.Tensor
+    scale: torch.Tensor
+    hidden_size: int
+    output_dtype: torch.dtype = torch.bfloat16
+
+
 class StandardDispatchOutput(NamedTuple):
     """Standard dispatch output."""
 
     hidden_states: torch.Tensor
     hidden_states_scale: Optional[torch.Tensor]
     topk_output: TopKOutput
-    # Pre-quantized activation for ``hidden_states``, which itself stays bf16:
+    # MXFP4 carries packed hidden_states and an explicit logical size/dtype.
+    # Other pre-quantized activations keep hidden_states in bf16:
     # either a (q, scale) pair (per-token-group-128 fp8, q rows padded to a
     # multiple of 4) or an ``Mxfp8RoutedInputPreQuant``.
     hidden_states_pre_quant: Optional[Tuple] = None
@@ -132,7 +142,6 @@ class StandardDispatcher(BaseDispatcher):
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> StandardDispatchOutput:
-
         if should_use_flashinfer_cutlass_moe_fp4_allgather():
             # all-gather fp4 hidden states
             if (
