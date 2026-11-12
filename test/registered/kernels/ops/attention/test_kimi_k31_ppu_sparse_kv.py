@@ -1,5 +1,7 @@
 """PPU K3.1 sparse prefill and paged decode over one FP8 DSA KV cache."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -55,3 +57,54 @@ def test_sparse_prefill_and_kv_decode_share_fp8_cache():
     torch.testing.assert_close(
         decode.reshape(64, 512).float(), reference[0], atol=0.02, rtol=0.02
     )
+
+
+@pytest.mark.skipif(
+    not is_sail() or torch.cuda.get_device_capability() != (8, 9),
+    reason="quantized sparse prefill requires ZW-M890P",
+)
+@pytest.mark.parametrize("heads,has_prefix", [(12, False), (96, True)])
+def test_quantized_prefill(heads, has_prefix):
+    from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
+        dequantize_k_cache_paged,
+    )
+    from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
+    from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+
+    torch.manual_seed(17)
+    kv = (torch.randn(2, 64, 1, 576, device="cuda") * 0.5).bfloat16()
+    kv_cache = quantize_k_cache(kv, pow2_scale=True).view(-1, 1, 656)
+    fresh = kv.view(-1, 1, 576)
+    slots = None
+    if has_prefix:
+        # Two requests can reference the same physical slot in different ragged rows.
+        slots = (torch.arange(128, device="cuda", dtype=torch.int32) * 17) % 97
+        keys = dequantize_k_cache_paged(kv_cache, slots)
+    else:
+        keys = fresh
+
+    q = (torch.randn(3, heads, 576, device="cuda") * 0.5).bfloat16()
+    cols = torch.arange(128, dtype=torch.int32, device="cuda")
+    indices = cols.roll(13).expand(len(q), -1).contiguous()
+    indices[:, 11] = -1
+    lengths = torch.tensor([32, 95, 128], dtype=torch.int32, device="cuda")
+    layer = SimpleNamespace(scaling=192**-0.5, v_head_dim=512)
+    backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+    backend.device_sm_major = torch.cuda.get_device_capability()[0]
+    backend.kimi_k31 = True
+    backend.attn_dcp_size = 1
+    backend.forward_metadata = SimpleNamespace(
+        page_table_1_flattened=slots, dsa_cache_seqlens_int32=lengths
+    )
+    result = backend._forward_flashmla_sparse_quantized(
+        q, kv_cache, fresh[..., :512], fresh[..., 512:], indices, layer
+    )
+
+    keys = keys[:, 0].to(torch.float8_e4m3fn).float()[indices.clamp_min(0).long()]
+    scores = (q.to(torch.float8_e4m3fn).float() @ keys.transpose(1, 2)) * layer.scaling
+    valid = (indices >= 0) & (cols < lengths[:, None])
+    weights = scores.masked_fill(~valid[:, None, :], -torch.inf).softmax(-1)
+    expected = weights @ keys[..., :512]
+    assert result.shape == (len(q), heads, 512)
+    assert result.dtype == torch.bfloat16
+    assert (result.float() - expected).norm() < 0.04 * expected.norm()
