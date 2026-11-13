@@ -29,6 +29,7 @@ if get_device_sm() >= 89:
     )
 
 from sglang.srt.layers.moe.token_dispatcher.standard import (
+    Mxfp4RoutedInputPreQuant,
     StandardCombineInput,
     StandardDispatchOutput,
 )
@@ -713,6 +714,7 @@ def deep_moe_impl_fused(
     use_mxfp4_w4a8: bool = False,
     w1_inv_scale: float = 1.0,
     w2_inv_scale: float = 1.0,
+    pre_quant_input: Optional[Mxfp4RoutedInputPreQuant] = None,
 ):
     block_align = 1
 
@@ -720,6 +722,8 @@ def deep_moe_impl_fused(
         routed_scaling_factor = 1.0
 
     num_tokens, K = hidden_states.shape
+    if pre_quant_input is not None:
+        K = pre_quant_input.hidden_size
     E, N, _ = w1.shape
     _, top_k = topk_ids.shape
 
@@ -742,7 +746,22 @@ def deep_moe_impl_fused(
     # Only the FP8 block-wise path emits column-major activation scales.
     act_scale_col_major = False
 
-    if use_mxfp4_w4a8:
+    if use_mxfp4:
+        from sglang.srt.layers.quantization.ppu_mxfp4_utils import downcast_to_mxfp4
+
+    if pre_quant_input is not None:
+        assert use_mxfp4 and use_fused_path and not use_mxfp4_w4a8
+        assert pre_quant_input.output_dtype == torch.bfloat16
+        assert hidden_states.dtype == torch.uint8
+        assert hidden_states.shape == (num_tokens, K // 2)
+        assert pre_quant_input.scale.shape == (num_tokens, (K + 63) // 64)
+        assert pre_quant_input.scale.dtype == torch.uint16
+        hidden_states, hidden_states_scale = (
+            pre_quant_input.quant,
+            pre_quant_input.scale,
+        )
+        block_k = block_shape[1]
+    elif use_mxfp4_w4a8:
         hidden_states, hidden_states_scale = sglang_per_token_quant_fp8(hidden_states)
         block_k = K
     elif use_int8:
@@ -769,8 +788,6 @@ def deep_moe_impl_fused(
             )
             act_scale_col_major = True
     elif use_mxfp4:
-        from sglang.srt.layers.quantization.ppu_mxfp4_utils import downcast_to_mxfp4
-
         # hidden_states: torch.uint8, hidden_states_scale: torch.uint16
         hidden_states, hidden_states_scale = downcast_to_mxfp4(
             hidden_states, axis=1, enable_fused_moe=use_fused_path
@@ -1086,7 +1103,19 @@ def fused_experts_none_to_deep_gemm(
 
     topk_weights, topk_ids, _ = topk_output
     routed_scaling_factor = moe_runner_config.routed_scaling_factor
-    output = hidden_states if runner_config.inplace else torch.empty_like(hidden_states)
+    pre_quant = dispatch_output.hidden_states_pre_quant
+    pre_quant = pre_quant if isinstance(pre_quant, Mxfp4RoutedInputPreQuant) else None
+    output = (
+        torch.empty(
+            (hidden_states.shape[0], pre_quant.hidden_size),
+            dtype=pre_quant.output_dtype,
+            device=hidden_states.device,
+        )
+        if pre_quant is not None
+        else hidden_states
+        if runner_config.inplace
+        else torch.empty_like(hidden_states)
+    )
 
     deep_moe_impl_fused(
         hidden_states=hidden_states,
@@ -1115,6 +1144,7 @@ def fused_experts_none_to_deep_gemm(
         activation=moe_runner_config.activation,
         gate_up_interleaved=moe_runner_config.gate_up_interleaved,
         out_hidden_states=output,
+        pre_quant_input=pre_quant,
     )
 
     return StandardCombineInput(hidden_states=output)
