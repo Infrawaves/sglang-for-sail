@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.utils import is_sail
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -205,7 +206,12 @@ class DSATopKBackend(Enum):
             and lengths.shape[0] == logits.shape[0] == topk_indices_offset.shape[0]
         ):
             return _topk_transform_v2_ragged(
-                logits, lengths, topk, topk_indices_offset, row_starts
+                logits,
+                lengths,
+                topk,
+                topk_indices_offset,
+                row_starts,
+                attn_metadata=attn_metadata,
             )
 
         # Packed PAGED extend (DSA prefill on ROCm and Kimi-K3.1): exact, where the
@@ -506,6 +512,8 @@ def _topk_transform_v2_ragged(
     topk: int,
     topk_indices_offset: torch.Tensor,
     row_starts: Optional[torch.Tensor],
+    *,
+    attn_metadata=None,
 ) -> torch.Tensor:
     """Fused ragged top-k via the DeepSeek-V4 v2 JIT kernel.
 
@@ -518,6 +526,29 @@ def _topk_transform_v2_ragged(
     16B-aligned row stride (DeepGEMM's contiguous-KV output satisfies this by
     construction), int32 non-negative lengths, and ``0 < topk <= 2048``.
     """
+    if is_sail() and logits.dtype == torch.bfloat16:
+        from sglang.kernels.ops.attention.dsa.deep_select import (
+            topk_transform_ragged,
+        )
+
+        if attn_metadata is not None:
+            seq_lens_cpu = attn_metadata.indexer_seq_lens_cpu
+            if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
+                # Ragged K concatenates requests; a single request starts at zero.
+                # CPU lengths also bound the packed width without a GPU sync.
+                return topk_transform_ragged(
+                    logits,
+                    lengths,
+                    topk,
+                    topk_indices_offset,
+                    None if seq_lens_cpu.numel() == 1 else row_starts,
+                    max_seq_len=int(seq_lens_cpu.max()),
+                )
+
+        return topk_transform_ragged(
+            logits, lengths, topk, topk_indices_offset, row_starts
+        )
+
     from sglang.kernels.ops.attention.dsv4.topk import topk_transform_ragged_v2
 
     out = logits.new_empty((logits.shape[0], topk), dtype=torch.int32)
