@@ -3200,9 +3200,7 @@ class DeepseekSparseAttnBackend(
         # Determine required padding based on GPU architecture (use cached value)
         required_padding = 128 if self.device_sm_major >= 10 else 64
         if _is_sail and self.kimi_k31:
-            required_padding = (
-                (num_heads + required_padding - 1) // required_padding
-            ) * required_padding
+            required_padding = 1
 
         need_padding = num_heads % required_padding != 0
 
