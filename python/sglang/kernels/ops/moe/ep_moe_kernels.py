@@ -1847,7 +1847,7 @@ def ep_gather(
     num_warps = 2
     num_tokens = output_tensor.shape[0]
     hidden_size = input_tensor.shape[1]
-    BLOCK_D = 128 if hidden_size % 1024 != 0 else 1024  # block size of quantization
+    BLOCK_D = 1024
 
     # for models (hidden_size % 128 != 0, such as gpt-oss model)
     # avoid condition check error of the following ep_gather kernel
