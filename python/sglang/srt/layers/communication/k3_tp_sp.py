@@ -55,13 +55,23 @@ class TPTokenShard:
         comm = group.pynccl_comm
         return nullcontext() if comm is None else comm.change_state(enable=True)
 
-    def all_gather(self, local: torch.Tensor, group=None) -> torch.Tensor:
+    def all_gather(
+        self, local: torch.Tensor, group=None, *, registered_output=None
+    ) -> torch.Tensor:
         if self.num_tokens == 0:
             return local
         group = self.group if group is None else group
-        full = local.new_empty((self.padded_size, *local.shape[1:]))
+        full = (
+            local.new_empty((self.padded_size, *local.shape[1:]))
+            if registered_output is None
+            else registered_output
+        )
         with self._comm(group):
-            group.all_gather_into_tensor(full, self._pad(local, self.shard_size))
+            padded = self._pad(local, self.shard_size)
+            if registered_output is None:
+                group.all_gather_into_tensor(full, padded)
+            else:
+                group.pynccl_comm.all_gather(full, padded, use_ce=True)
         return full[: self.num_tokens]
 
     def reduce_scatter(self, partial: torch.Tensor, group=None) -> torch.Tensor:

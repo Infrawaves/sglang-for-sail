@@ -580,16 +580,28 @@ class NCCLLibrary:
         datatype: int,
         comm: ncclComm_t,
         stream: cudaStream_t,
+        *,
+        use_ce: bool = False,
     ) -> None:
         # `datatype` actually should be `ncclDataType_t`
         # which is an aliases of `ctypes.c_int`
         # when we pass int to a function, it will be converted to `ctypes.c_int`
         # by ctypes automatically
-        self.NCCL_CHECK(
-            self._funcs["ncclAllGather"](
-                sendbuff, recvbuff, count, datatype, comm, stream
-            )
-        )
+        symbol = "pcclAllGatherCe" if use_ce else "ncclAllGather"
+        all_gather = self._funcs.get(symbol)
+        if all_gather is None:
+            try:
+                all_gather = getattr(self.lib, symbol, None)
+                if all_gather is None:
+                    all_gather = getattr(ctypes.CDLL("libpccl.so"), symbol)
+            except (OSError, AttributeError) as exc:
+                raise RuntimeError(
+                    "Explicit CE AllGather requires PCCL with pcclAllGatherCe"
+                ) from exc
+            all_gather.restype = self._funcs["ncclAllGather"].restype
+            all_gather.argtypes = self._funcs["ncclAllGather"].argtypes
+            self._funcs[symbol] = all_gather
+        self.NCCL_CHECK(all_gather(sendbuff, recvbuff, count, datatype, comm, stream))
 
     def ncclSend(
         self,

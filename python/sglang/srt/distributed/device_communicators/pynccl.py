@@ -194,6 +194,8 @@ class PyNcclCommunicator:
         output_tensor: torch.Tensor,
         input_tensor: torch.Tensor,
         sizes: Optional[list[int]] = None,
+        *,
+        use_ce: bool = False,
     ):
         if self.disabled:
             return
@@ -207,6 +209,8 @@ class PyNcclCommunicator:
         stream = self._resolve_stream()
 
         if sizes is not None:
+            if use_ce:
+                raise ValueError("Explicit CE AllGather requires equal input sizes")
             split_offset = 0
 
             self.nccl.ncclGroupStart()
@@ -231,6 +235,7 @@ class PyNcclCommunicator:
                 ncclDataTypeEnum.from_torch(input_tensor.dtype),
                 self.comm,
                 cudaStream_t(stream.cuda_stream),
+                use_ce=use_ce,
             )
 
     def reduce_scatter(
