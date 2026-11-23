@@ -702,6 +702,8 @@ def grouped_gemm_nt_f4f4bf16_nopad(
     m_indices: torch.Tensor,
     m_rows: torch.Tensor = None,
     configs=None,
+    *,
+    layout_ready_event: Optional[torch.cuda.Event] = None,
 ):
     assert _is_sail, f"only ppu deepgemm support grouped_gemm_nt_f4f4bf16_nopad"
 
@@ -721,9 +723,14 @@ def grouped_gemm_nt_f4f4bf16_nopad(
         )
     )
 
+    launch_kwargs = (
+        {"layout_ready_event": layout_ready_event}
+        if layout_ready_event is not None
+        else {}
+    )
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(
-            lhs, rhs, bias, out, m_indices, m_rows, configs=best_config
+            lhs, rhs, bias, out, m_indices, m_rows, configs=best_config, **launch_kwargs
         )
 
 

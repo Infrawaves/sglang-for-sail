@@ -1049,9 +1049,25 @@ def deep_moe_impl_fused(
             a, a_scale, w2, w2_scale, out3, expert_ids, num_recv_tokens_per_expert
         )
     elif use_mxfp4:
-        grouped_gemm_nt_f4f4bf16_nopad(
-            a, a_scale, w2, w2_scale, b2, out3, expert_ids, num_recv_tokens_per_expert
+        submit_shared_rs = (
+            pre_quant_input.submit_shared_rs if pre_quant_input is not None else None
         )
+        if submit_shared_rs is None:
+            grouped_gemm_nt_f4f4bf16_nopad(
+                a, a_scale, w2, w2_scale, b2, out3, expert_ids, num_recv_tokens_per_expert
+            )
+        else:
+            layout_ready_event = torch.cuda.Event()
+            deep_gemm_wrapper.grouped_gemm_nt_f4f4bf16_nopad(
+                (a, a_scale),
+                (w2, w2_scale),
+                b2,
+                out3,
+                expert_ids,
+                num_recv_tokens_per_expert,
+                layout_ready_event=layout_ready_event,
+            )
+            submit_shared_rs(layout_ready_event)
     elif use_w4a16:
         grouped_gemm_nt_bf16i4bf16_nopad(
             a, w2, w2_scale, out3, expert_ids, num_recv_tokens_per_expert

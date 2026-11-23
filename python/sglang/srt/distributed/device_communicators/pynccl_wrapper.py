@@ -408,6 +408,21 @@ class NCCLLibrary:
         Function("ncclCommWindowDeregister", ncclResult_t, [ncclComm_t, ncclWindow_t]),
     ]
 
+    exported_functions_ce = [
+        Function(
+            "pcclAllGatherCe",
+            ncclResult_t,
+            [
+                buffer_type,
+                buffer_type,
+                ctypes.c_size_t,
+                ncclDataType_t,
+                ncclComm_t,
+                cudaStream_t,
+            ],
+        ),
+    ]
+
     # class attribute to store the mapping from the path to the library
     # to avoid loading the same library multiple times
     path_to_library_cache: Dict[str, Any] = {}
@@ -444,6 +459,8 @@ class NCCLLibrary:
             exported_functions = NCCLLibrary.exported_functions
             if hasattr(self.lib, "ncclCommWindowRegister"):
                 exported_functions.extend(NCCLLibrary.exported_functions_symm_mem)
+            if hasattr(self.lib, "pcclAllGatherCe"):
+                exported_functions.extend(NCCLLibrary.exported_functions_ce)
             for func in exported_functions:
                 f = getattr(self.lib, func.name)
                 f.restype = func.restype
@@ -590,6 +607,24 @@ class NCCLLibrary:
                 sendbuff, recvbuff, count, datatype, comm, stream
             )
         )
+
+    def pcclAllGatherCe(
+        self,
+        sendbuff: buffer_type,
+        recvbuff: buffer_type,
+        count: int,
+        datatype: int,
+        comm: ncclComm_t,
+        stream: cudaStream_t,
+    ) -> None:
+        all_gather = self._funcs.get("pcclAllGatherCe")
+        if all_gather is None:
+            raise RuntimeError(
+                "Explicit CE AllGather requires pcclAllGatherCe in the loaded "
+                "communication library. Set SGLANG_NCCL_SO_PATH to a PCCL "
+                "library that exports it."
+            )
+        self.NCCL_CHECK(all_gather(sendbuff, recvbuff, count, datatype, comm, stream))
 
     def ncclSend(
         self,

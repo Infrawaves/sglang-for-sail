@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -66,6 +66,7 @@ class Mxfp4RoutedInputPreQuant(NamedTuple):
     scale: torch.Tensor
     hidden_size: int
     output_dtype: torch.dtype = torch.bfloat16
+    submit_shared_rs: Optional[Callable[[torch.cuda.Event], None]] = None
 
 
 class StandardDispatchOutput(NamedTuple):
