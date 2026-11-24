@@ -692,6 +692,21 @@ class KimiK3MoE(nn.Module):
         else:
             self.shared_experts = None
 
+        self._shared_ce_ag = (
+            _is_sail
+            and (enable_tp_sp or parallel.enable_cp_tp_group_sharing)
+            and self.shared_experts is not None
+            and not self._shared_experts_tp1
+            and envs.SGLANG_K3_SHARED_EXPERTS_CE_AG.get()
+        )
+        if self._shared_ce_ag and not get_exec().comm.enable_symm_mem:
+            raise ValueError(
+                "SGLANG_K3_SHARED_EXPERTS_CE_AG requires --enable-symm-mem"
+            )
+        self._shared_rs_after_fc2_launch = (
+            envs.SGLANG_ENABLE_K3_SHARED_RS_AFTER_FC2_LAUNCH.get()
+        )
+
         # SBO (single batch overlap): shared experts are bf16 + tp1-replicated
         # (~264 MB/layer/rank), the routed path is a2a-latency bound in decode
         # with HBM idle; issue shared on the side stream, join before the tail
@@ -1917,9 +1932,18 @@ class KimiK3MoE(nn.Module):
             lengths[group.rank_in_group],
             has_padding=any(n != hidden_states.shape[0] for n in lengths),
         )
-        if self._local_mxfp4_front and not torch.cuda.is_current_stream_capturing():
+        valid_token_count = (
+            metadata.moe_local_token_count if is_in_breakable_cuda_graph() else None
+        )
+        if self._local_mxfp4_front and (
+            valid_token_count is not None
+            or not torch.cuda.is_current_stream_capturing()
+        ):
             return self._forward_token_shard(
-                hidden_states, shard, shared_front_fp32=True
+                hidden_states,
+                shard,
+                shared_front_fp32=True,
+                valid_token_count=valid_token_count,
             )
         return self._forward_cp_shard_rows(shard.all_gather(hidden_states))
 
@@ -1932,7 +1956,13 @@ class KimiK3MoE(nn.Module):
         return self._forward_token_shard(hidden_states, shard, prefix_sum)
 
     def _forward_token_shard(
-        self, hidden_states, shard, prefix_sum=None, *, shared_front_fp32=False
+        self,
+        hidden_states,
+        shard,
+        prefix_sum=None,
+        *,
+        shared_front_fp32=False,
+        valid_token_count: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Alternate CPU submissions; leave shared and routed RS independent."""
         if shard.num_tokens == 0:
@@ -1945,23 +1975,39 @@ class KimiK3MoE(nn.Module):
         shared_group = self._shared_experts_tp_group
         if get_parallel().enable_cp_tp_group_sharing:
             shared_group = get_parallel().shared_experts_tp_group
+        registered_output = None
+        capturing = torch.cuda.is_current_stream_capturing()
+        if self._shared_ce_ag and (not capturing or valid_token_count is not None):
+            from sglang.srt.layers.communication.k3_shared_ce_ag import (
+                prepare_shared_ce_gather,
+            )
+
+            registered_output = prepare_shared_ce_gather(
+                hidden_states, shard, shared_group, capturing=capturing
+            )
         if self.shared_experts is not None:
             # Fork before the routed front, and do not wait on main again:
             # shared GEMMs must be free to overlap the later routed AG.
             self.alt_stream.wait_stream(current)
             with torch.cuda.stream(self.alt_stream):
                 if not self._shared_experts_tp1:
-                    shared_input = shard.all_gather(hidden_states, shared_group)
+                    shared_input = shard.all_gather(
+                        hidden_states, shared_group, registered_output=registered_output
+                    )
                 elif shard.local_size:
                     shared_input = hidden_states
 
         pre_quantized = (
             self._local_mxfp4_front
             and hidden_states.dtype == torch.bfloat16
-            and not torch.cuda.is_current_stream_capturing()
+            and not capturing
         )
-        local_hidden = hidden_states[: shard.valid_size]
-        if shard.valid_size:
+        local_hidden = (
+            hidden_states
+            if valid_token_count is not None
+            else hidden_states[: shard.valid_size]
+        )
+        if local_hidden.shape[0]:
             if pre_quantized and self._front_w is not None and self._front_is_ep_pair:
                 front = _k3_bf16_gemm(
                     local_hidden, self._front_w, out_dtype=torch.float32
@@ -1979,15 +2025,22 @@ class KimiK3MoE(nn.Module):
         else:
             topk = self.sp_topk.empty_topk_output(hidden_states.device)
             routed_input = hidden_states.new_empty((0, self.moe_hidden_size))
+        topk_weights, topk_ids = topk.topk_weights, topk.topk_ids
+        if valid_token_count is not None:
+            padding = torch.arange(local_hidden.shape[0], device=local_hidden.device)
+            padding = (padding >= valid_token_count)[:, None]
+            routed_input = routed_input.masked_fill(padding, 0)
+            topk_weights = topk_weights.masked_fill(padding, 0)
+            topk_ids = topk_ids.masked_fill(padding, -1)
         if pre_quantized:
             from sglang.srt.layers.quantization.ppu_mxfp4_utils import downcast_to_mxfp4
 
             quant, scale = downcast_to_mxfp4(
                 routed_input, axis=1, enable_fused_moe=True
             )
-            routed_tensors = (quant, scale, topk.topk_weights, topk.topk_ids)
+            routed_tensors = (quant, scale, topk_weights, topk_ids)
         else:
-            routed_tensors = (routed_input, topk.topk_weights, topk.topk_ids)
+            routed_tensors = (routed_input, topk_weights, topk_ids)
         packed = shard.pack_moe_inputs(*routed_tensors)
         gathered = shard.all_gather(packed)
 
@@ -2007,6 +2060,16 @@ class KimiK3MoE(nn.Module):
                 else:
                     shared_partial = self.shared_experts(shared_input)
 
+        def submit_shared_rs(
+            layout_ready_event: Optional[torch.cuda.Event] = None,
+        ) -> None:
+            nonlocal shared_output, shared_event
+            with torch.cuda.stream(self.alt_stream):
+                if layout_ready_event is not None:
+                    self.alt_stream.wait_event(layout_ready_event)
+                shared_output = shard.reduce_scatter(shared_partial, shared_group)
+                shared_event = self.alt_stream.record_event()
+
         unpacked = shard.unpack_moe_inputs(gathered, *routed_tensors)
         pre_quant = None
         if pre_quantized:
@@ -2016,13 +2079,22 @@ class KimiK3MoE(nn.Module):
 
             routed_input, scale, topk_weights, topk_ids = unpacked
             pre_quant = Mxfp4RoutedInputPreQuant(
-                routed_input, scale, self.moe_hidden_size
+                routed_input,
+                scale,
+                self.moe_hidden_size,
+                submit_shared_rs=(
+                    submit_shared_rs
+                    if self._shared_rs_after_fc2_launch
+                    and shared_partial is not None
+                    and not self._shared_experts_tp1
+                    else None
+                ),
             )
         else:
             routed_input, topk_weights, topk_ids = unpacked
         # Padding carries zero weights; -1 also prevents expert workspace slots
         # being consumed by rows that do not belong to a request.
-        if shard.has_padding:
+        if valid_token_count is None and shard.has_padding:
             topk_ids.masked_fill_(topk_weights == 0, -1)
         topk_output = StandardTopKOutput(topk_weights, topk_ids, router_logits=None)
         expert_output = (
@@ -2030,14 +2102,12 @@ class KimiK3MoE(nn.Module):
             if pre_quantized
             else self.experts(routed_input, topk_output)
         )
-        if shared_partial is not None:
-            with torch.cuda.stream(self.alt_stream):
-                shared_output = (
-                    shared_partial
-                    if self._shared_experts_tp1
-                    else shard.reduce_scatter(shared_partial, shared_group)
-                )
+        if shared_partial is not None and shared_event is None:
+            if self._shared_experts_tp1:
+                shared_output = shared_partial
                 shared_event = self.alt_stream.record_event()
+            else:
+                submit_shared_rs()
 
         expert_output = shard.reduce_scatter(expert_output)
         if shard.local_size and self.use_latent_moe:

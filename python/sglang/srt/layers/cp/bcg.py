@@ -342,7 +342,8 @@ class KimiK31CPBCGInput(PrefillCPBCGInput):
         return result
 
     def model_positions(self, forward_batch: ForwardBatch) -> torch.Tensor:
-        return self.positions[: forward_batch.input_embeds.shape[0]]
+        bucket = forward_batch.attn_cp_metadata.graph_num_tokens
+        return self.positions[: self.bucket_local_tokens[bucket]]
 
     def prepare(
         self,

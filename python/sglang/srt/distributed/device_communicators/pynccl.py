@@ -233,6 +233,23 @@ class PyNcclCommunicator:
                 cudaStream_t(stream.cuda_stream),
             )
 
+    def all_gather_ce(self, output_tensor: torch.Tensor, input_tensor: torch.Tensor):
+        """Gather equal-size inputs into an already registered symmetric buffer."""
+        if self.disabled:
+            return
+        assert input_tensor.device == self.device, (
+            f"this comm is on {self.device}, but the input is on {input_tensor.device}"
+        )
+        stream = self._resolve_stream()
+        self.nccl.pcclAllGatherCe(
+            buffer_type(input_tensor.data_ptr()),
+            buffer_type(output_tensor.data_ptr()),
+            input_tensor.numel(),
+            ncclDataTypeEnum.from_torch(input_tensor.dtype),
+            self.comm,
+            cudaStream_t(stream.cuda_stream),
+        )
+
     def reduce_scatter(
         self,
         output_tensor: torch.Tensor,
