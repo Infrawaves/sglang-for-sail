@@ -250,6 +250,61 @@ def test_topk_transform_ragged_kernel(
 
 
 @pytest.mark.skipif(
+    not torch.cuda.is_available() or "ZW" not in torch.cuda.get_device_name(),
+    reason="the exact ragged kernel is only built for PPU",
+)
+@pytest.mark.parametrize("dist", ["randn", "narrow", "ties", "signed_zeros"])
+@pytest.mark.parametrize("prefix", [0, 32768])
+@pytest.mark.parametrize("has_row_starts", [True, False])
+@torch.inference_mode()
+def test_topk_transform_ragged_exact_ppu(
+    dist: str, prefix: int, has_row_starts: bool
+) -> None:
+    # Prefill-CP row shape with growing lengths. "narrow", "ties" and "signed_zeros"
+    # defeat the sampled threshold and must still return the exact top-k.
+    torch.manual_seed(0)
+    k, bs = 2048, 256
+    lengths = (prefix + 64 * torch.arange(bs, device="cuda") + 1).int()
+    width = int(lengths.max()) + 2048
+    if dist == "randn":
+        score = torch.randn(bs, width, device="cuda")
+    elif dist == "narrow":
+        score = 4.0 + torch.rand(bs, width, device="cuda") * 1e-3
+    elif dist == "ties":
+        score = torch.randint(0, 4, (bs, width), device="cuda").float()
+    else:
+        r = torch.rand(bs, width, device="cuda")
+        score = torch.where(r < 0.97, torch.where(r < 0.5, -0.0, 0.0), r)
+    row_starts = (
+        torch.randint(0, 2048, (bs,), dtype=torch.int32, device="cuda")
+        if has_row_starts
+        else None
+    )
+    offset = torch.randint(0, 1024, (bs,), dtype=torch.int32, device="cuda")
+
+    out = fast_topk_transform_ragged_fused(
+        score=score,
+        lengths=lengths,
+        topk_indices_offset=offset,
+        topk=k,
+        row_starts=row_starts,
+    )
+
+    short = lengths <= k
+    ar = torch.arange(k, device="cuda")
+    want_short = torch.where(ar < lengths[:, None], ar + offset[:, None], -1)
+    assert torch.equal(out[short], want_short[short])
+    long_rows = (~short).nonzero().squeeze(1)
+    assert_exact_rows(
+        score[long_rows],
+        out[long_rows] - offset[long_rows, None],
+        lengths[long_rows],
+        k,
+        row_starts=None if row_starts is None else row_starts[long_rows],
+    )
+
+
+@pytest.mark.skipif(
     torch.version.hip is None,
     reason="deepseek_v4_topk_transform_512 is only built on ROCm",
 )
